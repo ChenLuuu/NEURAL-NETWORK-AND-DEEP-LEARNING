@@ -1,0 +1,250 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+from torch.utils.data import random_split
+from tqdm import tqdm
+import torch.nn.functional as F
+from network import CustomCNN
+
+# Set device
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    torch.set_default_tensor_type('torch.FloatTensor')
+else:
+    device = torch.device("cpu")
+print(f"Using device: {device}")
+
+# Data preprocessing
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+# Load datasets
+print("\nLoading datasets...")
+full_trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform)
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=False, transform=transform)
+
+# Split training set into train and validation
+train_size = int(0.99 * len(full_trainset))
+val_size = len(full_trainset) - train_size
+trainset, valset = random_split(full_trainset, [train_size, val_size])
+print(f"Dataset sizes - Train: {len(trainset)}, Validation: {len(valset)}, Test: {len(testset)}")
+
+# Create data loaders
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=0)
+valloader = torch.utils.data.DataLoader(valset, batch_size=128, shuffle=False, num_workers=0)
+testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=0)
+
+def evaluate_metrics(model, dataloader, criterion):
+    """
+    Evaluate model accuracy and loss on the provided dataset
+    """
+    correct = 0
+    total = 0
+    total_loss = 0
+    model.eval()
+    with torch.no_grad():
+        for data in dataloader:
+            images, labels = data[0].to(device), data[1].to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return 100 * correct / total, total_loss / len(dataloader)
+
+def train_model(model, optimizer, criterion, scheduler=None, epochs=10, name="Model"):
+    """
+    Train the model and return metrics for plotting
+    """
+    train_losses = []
+    train_accs = []
+    val_losses = []
+    val_accs = []
+    learning_rates = []
+    
+    print(f"\nTraining with {name}...")
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        # Store current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
+        
+        pbar = tqdm(trainloader, desc=f'Epoch {epoch+1}/{epochs} (lr={current_lr:.6f})')
+        
+        for i, data in enumerate(pbar, 0):
+            inputs, labels = data[0].to(device), data[1].to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            pbar.set_postfix({
+                'loss': f'{running_loss/(i+1):.3f}',
+                'acc': f'{100*correct/total:.1f}%'
+            })
+        
+        # Evaluate metrics
+        train_acc, train_loss = evaluate_metrics(model, trainloader, criterion)
+        val_acc, val_loss = evaluate_metrics(model, valloader, criterion)
+        
+        train_losses.append(train_loss)
+        train_accs.append(train_acc)
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+        
+        print(f'Epoch {epoch + 1}/{epochs}:')
+        print(f'Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%')
+        print(f'Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.2f}%')
+        
+        # Step the scheduler if it exists
+        if scheduler is not None:
+            scheduler.step()
+    
+    return train_losses, train_accs, val_losses, val_accs, learning_rates
+
+# Define different optimizer configurations
+optimizer_configs = {
+    'SGD': {
+        'optimizer': lambda params: optim.SGD(params, lr=0.01),
+        'scheduler': None
+    },
+    'SGD with Momentum': {
+        'optimizer': lambda params: optim.SGD(params, lr=0.01, momentum=0.9),
+        'scheduler': None
+    },
+    'SGD with Momentum & LR Decay': {
+        'optimizer': lambda params: optim.SGD(params, lr=0.01, momentum=0.9),
+        'scheduler': lambda opt: optim.lr_scheduler.StepLR(opt, step_size=3, gamma=0.1)
+    },
+    'Adam': {
+        'optimizer': lambda params: optim.Adam(params, lr=0.001),
+        'scheduler': None
+    },
+    'AdamW': {
+        'optimizer': lambda params: optim.AdamW(params, lr=0.001, weight_decay=0.01),
+        'scheduler': None
+    },
+    'RMSprop': {
+        'optimizer': lambda params: optim.RMSprop(params, lr=0.001, momentum=0.9),
+        'scheduler': None
+    },
+    'Adagrad': {
+        'optimizer': lambda params: optim.Adagrad(params, lr=0.01),
+        'scheduler': None
+    },
+    'Adadelta': {
+        'optimizer': lambda params: optim.Adadelta(params, lr=1.0),
+        'scheduler': None
+    }
+}
+
+# Train models with different optimizers
+results = {}
+epochs = 10
+
+for name, config in optimizer_configs.items():
+    print(f"\nTraining model with {name}...")
+    model = CustomCNN().to(device)
+    optimizer = config['optimizer'](model.parameters())
+    scheduler = config['scheduler'](optimizer) if config['scheduler'] is not None else None
+    criterion = nn.CrossEntropyLoss()
+    
+    metrics = train_model(
+        model, 
+        optimizer, 
+        criterion,
+        scheduler=scheduler,
+        epochs=epochs,
+        name=name
+    )
+    results[name] = metrics
+
+# Create plots
+plt.figure(figsize=(20, 15))
+
+# Training Loss
+plt.subplot(3, 2, 1)
+for name, (train_losses, _, _, _, _) in results.items():
+    plt.plot(train_losses, label=name)
+plt.title('Training Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Training Accuracy
+plt.subplot(3, 2, 2)
+for name, (_, train_accs, _, _, _) in results.items():
+    plt.plot(train_accs, label=name)
+plt.title('Training Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.grid(True)
+
+# Validation Loss
+plt.subplot(3, 2, 3)
+for name, (_, _, val_losses, _, _) in results.items():
+    plt.plot(val_losses, label=name)
+plt.title('Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Validation Accuracy
+plt.subplot(3, 2, 4)
+for name, (_, _, _, val_accs, _) in results.items():
+    plt.plot(val_accs, label=name)
+plt.title('Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.grid(True)
+
+# Learning Rate Schedule
+plt.subplot(3, 2, (5, 6))
+for name, (_, _, _, _, lrs) in results.items():
+    plt.plot(lrs, label=name)
+plt.title('Learning Rate Schedule')
+plt.xlabel('Epoch')
+plt.ylabel('Learning Rate')
+plt.yscale('log')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('optimizer_comparison.png')
+plt.close()
+
+# Print final results summary
+print("\nFinal Results Summary:")
+print("-" * 80)
+print(f"{'Optimizer':<25} {'Train Acc':<12} {'Val Acc':<12} {'Train Loss':<12} {'Val Loss':<12}")
+print("-" * 80)
+for name in optimizer_configs.keys():
+    train_loss = results[name][0][-1]
+    train_acc = results[name][1][-1]
+    val_loss = results[name][2][-1]
+    val_acc = results[name][3][-1]
+    print(f"{name:<25} {train_acc:>11.2f}% {val_acc:>11.2f}% {train_loss:>11.4f} {val_loss:>11.4f}")
+
+print("\nTraining completed! Results saved to optimizer_comparison.png") 
